@@ -36,15 +36,13 @@ Each customer's records are then collapsed to a single row using the **worst** s
 
 ```
 .
-├── Rscript.R                  # Exploratory data analysis + statistical testing
-├── Credit_Card_Approval.Rmd   # Data preprocessing + modeling notebook
-├── application_record.csv     # Applicant data (source)
-├── credit_record.csv          # Credit history data (source)
-├── plots/                     # Saved EDA visualizations (PNG)
+├── Rscript.R                              # Exploratory data analysis + statistical testing
+├── Credit_Card_Approval_Prediction.Rmd    # Data preprocessing + modeling notebook
+├── application_record.csv                 # Applicant data (source)
+├── credit_record.csv                      # Credit history data (source)
+├── plots/                                 # Saved EDA visualizations (PNG)
 └── README.md
 ```
-
-*(Adjust the file names above to match exactly what you upload.)*
 
 ## Workflow
 
@@ -61,7 +59,7 @@ The EDA stage builds and merges the target, then explores the data through visua
 
 Saved plots are available in the `plots/` folder.
 
-### 2. Data Preprocessing & Feature Engineering (`Credit_Card_Approval.Rmd`)
+### 2. Data Preprocessing & Feature Engineering (`Credit_Card_Approval_Prediction.Rmd`)
 
 - Converting data types and recoding yes/no fields (gender, car, property) to 0/1
 - Grouping high-cardinality categories (income type, education, family status, housing, occupation) into simpler buckets with `case_when`
