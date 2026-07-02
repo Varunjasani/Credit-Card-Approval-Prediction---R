@@ -38,8 +38,6 @@ Each customer's records are then collapsed to a single row using the **worst** s
 .
 ├── Rscript.R                              # Exploratory data analysis + statistical testing
 ├── Credit_Card_Approval_Prediction.Rmd    # Data preprocessing + modeling notebook
-├── application_record.csv                 # Applicant data (source)
-├── credit_record.csv                      # Credit history data (source)
 ├── plots/                                 # Saved EDA visualizations (PNG)
 └── README.md
 ```
