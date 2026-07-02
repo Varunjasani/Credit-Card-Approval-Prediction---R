@@ -1,0 +1,827 @@
+---
+title: "Draft Model Credit Card Approval Prediction"
+output:
+  word_document: default
+  html_notebook: default
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+### Load all the packages we need for data cleaning, plotting, sampling and building the models
+library(dplyr)                    # data wrangling (mutate, filter, group_by etc.)
+library(janitor)                  # helper functions for cleaning up data
+library(ggplot2)                  # plotting
+library(leaflet)                  # maps (not really needed here, but loaded anyway)
+library(scales)                   # nice axis scales and the cut_number function used later
+library(tidyr)                    # reshaping data (pivot_wider etc.)
+library(caret)                    # machine learning helpers like upSample and confusionMatrix
+library(corrplot)                 # correlation plots
+library(smotefamily)              # SMOTE style sampling for imbalanced data
+library(performanceEstimation)    # model performance tools
+library(ROSE)                     # another sampling method for imbalanced data
+library(randomForest)             # random forest model
+library(glmnet)                   # ridge and lasso regression
+library(pROC)                     # ROC curve and AUC score
+library(e1071)                    # support vector machine (SVM)
+```
+
+
+```{r}
+# Read the two source CSV files into R
+application <- read.csv("application_record.csv")   # applicant details (income, age, job etc.)
+credit<- read.csv("credit_record.csv")              # monthly payment history for each applicant
+```
+
+
+```{r}
+# Quick look at the structure of the data
+# str(application)
+# str(credit)
+glimpse(credit)                   # show columns, types and a few sample values from the credit data
+```
+
+### Target setting
+
+STATUS: 0: 1-29 days past due 1: 30-59 days past due 2: 60-89 days overdue 3: 90-119 days overdue 4: 120-149 days overdue 5: Overdue or bad debts, write-offs for more than 150 days C: paid off that month X: No loan for the month.
+
+Customer with over 30 days or more past due would be considered as a ‘bad’ customer. 
+Based on this consideration, we can adjust the value of “STATUS” column to be 1 (bad customer) and 0 (good customer) and make it as our target for our model.
+```{r}
+
+# Build the target variable from the STATUS column
+credit$target <- credit$STATUS          # start by copying STATUS into a new column called target
+unique(credit$target)                   # check all the different values STATUS can take
+
+# Treat "X" (no loan) and "C" (paid off) as good customers -> 0, keep the rest as they are
+credit$target <- ifelse(credit$target == 'X' | credit$target == 'C', 0, credit$target)
+credit$target <- as.integer(credit$target)   # turn the values into whole numbers
+credit$target[credit$target >= 1] <- 1       # anything 1 or more (30+ days late) becomes a bad customer -> 1
+
+credit_df <- aggregate(target ~ ID, data = credit, FUN = max)
+```
+Target Rate 
+```{r}
+# Count how many good (0) vs bad (1) customers we have
+dplyr::count(credit_df, target, sort = TRUE)
+```
+Cleaning Application data
+```{r}
+# Fix up data types and turn some yes/no text columns into 0/1 numbers
+application <- application %>% 
+  mutate_if(is.character, as.factor) %>%   # text columns become factors
+  mutate_if(is.double, as.integer) %>%     # decimal number columns become whole numbers
+  mutate(CODE_GENDER = as.integer(ifelse(CODE_GENDER == "M", 1, 0)),          # Male = 1, Female = 0
+         FLAG_OWN_CAR = as.integer(ifelse(FLAG_OWN_CAR == "Y", 1, 0)),        # owns a car = 1, else 0
+         FLAG_OWN_REALTY = as.integer(ifelse(FLAG_OWN_REALTY == "Y", 1, 0)))  # owns property = 1, else 0
+```
+
+
+```{r}
+# Join the applicant details with the good/bad target using the shared ID column
+credit_data <- merge(application, credit_df, by = "ID") %>% 
+  select(-c(ID))                  # drop the ID column since we don't need it for modelling
+head(credit_data)                 # peek at the first few rows of the combined data
+```
+
+
+```{r}
+# Count of good vs bad customers in the merged dataset
+dplyr::count(credit_data, target, sort = TRUE)
+```
+### Exploratory Data Analysis
+
+```{r}
+# See how good/bad customers break down by income type
+credit_data %>%
+  group_by(NAME_INCOME_TYPE, target) %>%
+  summarise(Freq = n(), .groups = 'drop') %>%              # count records in each group
+  pivot_wider(names_from = target, values_from = Freq, values_fill = 0) %>%  # make target 0/1 into columns
+  arrange(NAME_INCOME_TYPE)                                # sort by income type
+```
+
+
+```{r}
+# Same breakdown but by education level
+
+credit_data %>%
+  group_by(NAME_EDUCATION_TYPE, target) %>%
+  summarise(Freq = n(), .groups = 'drop') %>%
+  pivot_wider(names_from = target, values_from = Freq, values_fill = 0) %>%
+  arrange(NAME_EDUCATION_TYPE)
+```
+
+
+```{r}
+# Same breakdown but by family status
+
+credit_data %>%
+  group_by(NAME_FAMILY_STATUS, target) %>%
+  summarise(Freq = n(), .groups = 'drop') %>%
+  pivot_wider(names_from = target, values_from = Freq, values_fill = 0) %>%
+  arrange(NAME_FAMILY_STATUS)
+```
+
+
+```{r}
+# Same breakdown but by housing type
+
+credit_data %>%
+  group_by(NAME_HOUSING_TYPE, target) %>%
+  summarise(Freq = n(), .groups = 'drop') %>%
+  pivot_wider(names_from = target, values_from = Freq, values_fill = 0) %>%
+  arrange(NAME_HOUSING_TYPE)
+```
+
+
+```{r}
+# Same breakdown but by occupation type
+
+credit_data %>%
+  group_by(OCCUPATION_TYPE, target) %>%
+  summarise(Freq = n(),.groups = 'drop' ) %>%
+  pivot_wider(names_from = target, values_from = Freq, values_fill = 0) %>%
+  arrange(OCCUPATION_TYPE)
+```
+### Data Preprocessing
+
+```{r}
+# Roll the many income types into three simpler groups
+credit_data <- credit_data %>%
+  mutate(GROUPED_INCOME_TYPE = case_when(
+    NAME_INCOME_TYPE %in% c("Commercial associate", "State servant","Working") ~ "Employed",  # working people
+    NAME_INCOME_TYPE %in% c("Pensioner") ~ "Retired",                                         # pensioners
+    TRUE ~ "Other"                                                                            # everything else
+  ))
+unique(credit_data$GROUPED_INCOME_TYPE)   # check the new groups
+```
+
+
+```{r}
+# Roll education levels into simpler groups
+credit_data <- credit_data %>%
+  mutate(GROUPED_EDUCATION_TYPE = case_when(
+    NAME_EDUCATION_TYPE %in% c("Academic degree", "Higher education") ~ "Higher education",                
+    NAME_EDUCATION_TYPE %in% c("Incomplete higher","Secondary / secondary special") ~"Secondary Special",  
+    TRUE ~ "Other"
+  ))
+unique(credit_data$GROUPED_EDUCATION_TYPE)
+
+```
+
+
+```{r}
+# Roll family status into simpler groups
+credit_data <- credit_data %>%
+  mutate(GROUPED_FAMILY_STATUS = case_when(
+    NAME_FAMILY_STATUS %in% c("Civil marriage", "Married") ~ "Married",           # living with a partner
+    NAME_FAMILY_STATUS %in% c("Separated", "Single / not married") ~ "Single",    # on their own
+    TRUE ~ "Other"
+  ))
+unique(credit_data$GROUPED_FAMILY_STATUS)
+```
+
+
+```{r}
+# Group the housing types into fewer categories
+credit_data <- credit_data %>%
+  mutate(NAME_HOUSING_TYPE = case_when(
+    NAME_HOUSING_TYPE %in% c("Co-op apartment", "House / apartment", "With parents") ~ "House Apt",  # regular housing
+    NAME_HOUSING_TYPE %in% c("Municipal apartment", "Office apartment") ~ "Office Apt",              # office/municipal
+    TRUE ~ "Other"
+  ))
+unique(credit_data$NAME_HOUSING_TYPE)
+```
+
+
+```{r}
+# Group the long list of jobs into a few broad categories
+credit_data <- credit_data %>%
+  mutate(GROUPED_OCCUPATION_TYPE = case_when(
+    OCCUPATION_TYPE %in% c("Accountants", "High skill tech staff", "IT staff", "Managers") ~ "Professional",  # skilled/office roles
+    OCCUPATION_TYPE %in% c("Cleaning staff", "Cooking staff", "Drivers", "Laborers", "Low-skill Laborers", "Medicine staff", "Private service staff", "Realty agents", "Sales staff", "Security staff", "Waiters/barmen staff") ~ "Service/Manual",  # hands-on/service roles
+    OCCUPATION_TYPE %in% c("Core staff", "Secretaries") ~ "Support",   # support roles
+    TRUE ~ "Other"                                                     # blanks and anything else
+  )) 
+unique(credit_data$GROUPED_OCCUPATION_TYPE)
+```
+
+
+```{r}
+## Turn the "days" columns into easy to read ages and years worked
+# The original values are negative days counted back from today, so we flip the sign and divide by days in a year
+credit_data$AGE <- round(-credit_data$DAYS_BIRTH/365.24, 0)             # age in years
+credit_data$YEARS_EMPLOYED <- round(-credit_data$DAYS_EMPLOYED/365.24, 0)  # years employed
+```
+
+
+```{r}
+# Pensioners often have a strange negative "years employed" value, so fix those
+negative_years_pensioner <- credit_data$YEARS_EMPLOYED < 0 & credit_data$NAME_INCOME_TYPE == "Pensioner"  # find the bad rows
+credit_data$YEARS_EMPLOYED[negative_years_pensioner] <- 0                                                 # reset them to 0 first
+credit_data$YEARS_EMPLOYED[negative_years_pensioner] <- credit_data$AGE[negative_years_pensioner] - 18    # estimate years worked as age minus 18 (assumed start age)
+
+```
+
+
+```{r}
+## Drop the columns we no longer need (originals we already grouped, and the raw day columns)
+final_df <- subset(credit_data, select = -c(NAME_INCOME_TYPE, NAME_EDUCATION_TYPE, NAME_FAMILY_STATUS, NAME_HOUSING_TYPE,OCCUPATION_TYPE,
+                                            DAYS_BIRTH, DAYS_EMPLOYED,FLAG_MOBIL))
+str(final_df)                          # look at the final set of columns
+prop.table(table(final_df$target))     # see the proportion of good vs bad (shows the imbalance)
+```
+
+```{r}
+## Standardize the income column so it's on the same scale as other features
+mean_val <- mean(final_df$AMT_INCOME_TOTAL)   # average income
+sd_val <- sd(final_df$AMT_INCOME_TOTAL)       # spread (standard deviation) of income
+
+# Convert income to a z-score: how many standard deviations above/below the average
+final_df$AMT_INCOME_TOTAL <- (final_df$AMT_INCOME_TOTAL - mean_val) / sd_val
+```
+
+### Train Test Split
+```{r}
+set.seed(80307)   # fix the random seed so the split is the same every time we run it
+train_indices <- sample(x= nrow(final_df), size= nrow(final_df)* 0.70)   # randomly pick 70% of the rows for training
+
+# Split the rows into training and testing sets
+train_data <- final_df[train_indices,]    # the chosen 70%
+test_data <- final_df[-train_indices,]     # the remaining 30%
+
+# Check how many rows and columns each set has
+dim(train_data)
+dim(test_data)
+
+# Check the good/bad balance in each set
+table(train_data$target)
+table(test_data$target)
+```
+
+```{r}
+# Turn the data into the numeric matrix format that glmnet/svm need
+# model.matrix builds dummy variables for the text columns; [, -1] drops the intercept column
+train_x <- model.matrix(target ~ ., train_data)[, -1] 
+test_x <- model.matrix(target ~ ., test_data)[,-1]
+
+# Pull out the target column on its own
+train_y <- train_data$target
+test_y <- test_data$target
+
+dim(train_x)
+dim(test_x)
+```
+
+### Base Logistic Regression Model
+
+```{r}
+# Fit a basic logistic regression using every feature to predict good/bad
+model_glm <- glm(target ~., data=train_data, family= binomial(link="logit"))
+summary(model_glm)   # show coefficients and p-values
+```
+
+```{r}
+# Get predicted probabilities on the training data and turn them into 0/1 using a 0.5 cutoff
+probabilities.train_glm <- predict(model_glm, newdata=train_data, type="response")
+predicted.classes.train_glm <- ifelse(probabilities.train_glm > 0.5, 1, 0)
+
+probabilities.train_glm = as.integer(probabilities.train_glm)   # (note: this line rounds probabilities to integers)
+```
+
+
+```{r}
+# Model accuracy
+# conf_matrix_glm <- confusionMatrix(probabilities.train_glm, train_data$target)  # commented out (was throwing an error)
+```
+
+
+```{r}
+## Check which classes the model actually predicted
+unique(predicted.classes.train_glm)
+```
+Here we can see model is not able to predict 1 class and giving all 0 prediction
+
+```{r}
+# Try again using only the features that came out statistically significant (low p-value)
+significant_features <- c("CODE_GENDER", "FLAG_OWN_CAR", "FLAG_OWN_REALTY", "AMT_INCOME_TOTAL", "FLAG_EMAIL", "GROUPED_INCOME_TYPE", "GROUPED_OCCUPATION_TYPE", "AGE", "target")
+
+selected_model <- glm(target ~ ., family = binomial(link = "logit"), data = train_data[, significant_features])
+
+# View the summary of the new model
+summary(selected_model)
+```
+
+
+```{r}
+# Predict with the smaller model and label as Yes/No using a 0.5 cutoff
+probabilities.train_glm2 <- predict(selected_model, newdata=train_data, type="response")
+predicted.classes.train_glm2 <- as.factor(ifelse(probabilities.train_glm2 >=0.5,"Yes", "No"))
+
+# Model accuracy
+# conf_matrix_glm <- confusionMatrix(probabilities.train_glm, train_data$target, positive = "Yes")
+## Giving error
+```
+
+
+```{r}
+unique(predicted.classes.train_glm2)
+# Giving only "no" in prediction
+```
+### Ridge Regularization
+
+```{r}
+# Use cross validation to find the best lambda (penalty strength) for ridge regression
+set.seed(80307)
+cv.ridge <- cv.glmnet(train_x, train_y, nfolds = 10, alpha=0)   # alpha = 0 means ridge
+plot(cv.ridge)   # plot error against lambda
+```
+
+
+```{r}
+# Print the two useful lambda values from cross validation
+cat("lambda.min:", cv.ridge$lambda.min, "\n")   # lambda with the lowest error
+cat("lambda.1se:", cv.ridge$lambda.1se, "\n")   # slightly stronger penalty, still within 1 std error
+```
+
+
+```{r}
+# Fit the ridge model using the best (lowest error) lambda
+model.min_ridge <- glmnet(train_x, train_y, alpha= 0, lambda = cv.ridge$lambda.min)
+model.min_ridge
+# show the fitted coefficients
+coef(model.min_ridge)
+summary(model.min_ridge)
+```
+
+
+```{r}
+# Predict on the test set and turn probabilities into 0/1
+pred_probs <- predict(model.min_ridge, newx = test_x, s = "lambda.min", type = "response")
+pred_class <- ifelse(pred_probs > 0.5, 1, 0)
+
+# Build a confusion matrix comparing actual vs predicted
+conf_matrix <- table(Actual = test_y, Predicted = pred_class)
+conf_matrix
+```
+
+
+```{r}
+# Accuracy = correct predictions (diagonal) divided by total predictions
+accuracy_ridge <- sum(diag(conf_matrix)) / sum(conf_matrix)
+cat("Accuracy:", accuracy_ridge, "\n")
+```
+Unable to calculate recall because we don't have FP and TP 
+Still after ridge regularization model is not able to predict class 1
+
+### Lasso Regularization
+```{r}
+# Same idea as ridge, but now find the best lambda for lasso regression
+set.seed(80307)
+cv.lasso <- cv.glmnet(train_x, train_y, nfolds = 10, alpha=1)   # alpha = 1 means lasso
+plot(cv.lasso)
+```
+
+
+```{r}
+# Print the best lambda values for lasso
+cat("lambda.min_lasso:", cv.lasso$lambda.min, "\n")
+cat("lambda.1se_lasso:", cv.lasso$lambda.1se, "\n")
+```
+
+```{r}
+# Fit the lasso model with the best lambda
+model.min_lasso <- glmnet(train_x, train_y, alpha= 1, lambda = cv.lasso$lambda.min)
+model.min_lasso
+# show the coefficients (lasso can push some all the way to zero)
+coef(model.min_lasso)
+```
+
+
+```{r}
+# Predict on the test set and score with a confusion matrix
+pred_probs <- predict(model.min_lasso, newx = test_x, s = "lambda.min", type = "response")
+pred_class <- ifelse(pred_probs > 0.5, 1, 0)
+conf_matrix_lasso <- table(Actual = test_y, Predicted = pred_class)
+conf_matrix_lasso
+```
+
+```{r}
+# Accuracy for the lasso model
+accuracy_lasso <- sum(diag(conf_matrix_lasso)) / sum(conf_matrix_lasso)
+cat("Accuracy:", accuracy_lasso, "\n")
+```
+
+### Support Vector Machine model
+```{r}
+# Train an SVM with a radial kernel, then predict on the training data
+svm_model <- svm(x = train_x, y = train_y, kernel = "radial", cost = 0.1)
+predictions_svm <- predict(svm_model, newdata = train_x)
+predicted.classes.svm <- ifelse(predictions_svm >=0.5,1,0)   # convert to 0/1 labels
+```
+
+
+```{r}
+# Confusion matrix and accuracy for the SVM on training data
+conf_matrix_svm <- table(Actual = train_y, Predicted = predicted.classes.svm)
+accuracy_svm <- sum(diag(conf_matrix_svm)) / sum(conf_matrix_svm)
+cat("Accuracy:", accuracy_svm, "\n")
+```
+```{r}
+conf_matrix_svm
+```
+SVM model is also not able to predict class 1
+
+### Sampling
+```{r}
+# The data is heavily imbalanced, so first cut down the good customers (target = 0) to even things out
+train_data$target <- as.integer(train_data$target)
+
+df_0 <- train_data %>% 
+  filter(target == 0) %>%      # keep only good customers
+  slice(-c(1:10000))           # drop the first 10,000 of them to reduce the majority class
+
+df_1 <- train_data %>% 
+  filter(target == 1)          # keep all the bad customers
+```
+
+
+```{r}
+# Stick the reduced good customers and all bad customers back together
+credit_train <- rbind(df_0, df_1)
+dim(credit_train)
+```
+
+#### Applying Upsample technique on training dataset
+```{r}
+
+credit_train$target <- as.factor(credit_train$target)   # upSample needs the target as a factor
+
+# Up-sample the minority class so both classes have equal counts
+ups_df <- upSample(x = credit_train %>% select(-target),
+                   y = credit_train$target,
+                   yname = "target")
+table(ups_df$target)   # confirm both classes are now balanced
+```
+
+#### Prepare data for modelling 
+```{r}
+# Rebuild the numeric training matrix and target from the balanced data
+train_x <- model.matrix(target ~ ., ups_df)[, -1]
+train_y <- ups_df$target
+dim(train_x)
+dim(test_x)
+```
+
+
+```{r}
+# Compare test set balance vs the new balanced training set
+table(test_data$target)
+table(ups_df$target)
+```
+We can see Now training target is upsample and it's no more imbalanced dataset
+
+### Logistic Regression 
+```{r}
+# Fit logistic regression on the balanced training data
+model <- glm(target ~., data=ups_df, family= binomial())
+summary(model)
+```
+
+
+```{r}
+# Predict on the test data, convert to 0/1, then build a confusion matrix
+probabilities.test <- predict(model, newdata=test_data, type="response")
+predicted.classes.test <- ifelse(probabilities.test>=0.5,1,0)
+test_y <- as.factor(as.character(test_y))                    # make sure actual and predicted are the same type
+predicted.classes.test <- as.factor(predicted.classes.test)
+conf_matrix_lr <- table(Actual = test_y, Predicted = predicted.classes.test)
+conf_matrix_lr
+```
+
+```{r}
+# Accuracy and recall for the balanced logistic regression
+accuracy_lr <- sum(diag(conf_matrix_lr)) / sum(conf_matrix_lr)
+cat("Accuracy:", accuracy_lr, "\n")
+
+# Recall = of all the actual bad customers, how many did we catch
+recall_lr <- conf_matrix_lr[2, 2] / sum(conf_matrix_lr[2, ])
+cat("Recall:", recall_lr, "\n")
+```
+
+### Ridge Regularization
+```{r}
+# Find the best ridge lambda again, this time on the balanced data
+train_y = as.integer(as.character(train_y))   # glmnet needs a numeric target
+set.seed(80307)
+cv.ridge_reg <- cv.glmnet(train_x, train_y, nfolds = 10, alpha=0)
+plot(cv.ridge_reg)
+```
+
+```{r}
+# Print the best lambda values
+cat("lambda.min:", cv.ridge_reg$lambda.min, "\n")
+cat("lambda.1se:", cv.ridge_reg$lambda.1se, "\n")
+```
+
+
+```{r}
+# Fit the ridge model on balanced data using the best lambda
+model.min_ridge_reg <- glmnet(train_x, train_y, alpha= 0, lambda = cv.ridge_reg$lambda.min)
+
+coef(model.min_ridge_reg)
+summary(model.min_ridge_reg)
+```
+
+
+```{r}
+# Predict on test data and build the confusion matrix
+pred_probs <- predict(model.min_ridge_reg, newx = test_x, s = "lambda.min", type = "response")
+pred_class <- ifelse(pred_probs > 0.5, 1, 0)
+
+conf_matrix_ridge_reg <- table(Actual = test_y, Predicted = pred_class)
+conf_matrix_ridge_reg
+```
+
+
+```{r}
+# Accuracy and recall for the balanced ridge model
+accuracy_ridge <- sum(diag(conf_matrix_ridge_reg)) / sum(conf_matrix_ridge_reg)
+cat("Accuracy:", accuracy_ridge, "\n")
+
+recall_ridge <- conf_matrix_ridge_reg[2, 2] / sum(conf_matrix_ridge_reg[2, ])
+cat("Recall:", accuracy_ridge, "\n")
+```
+
+### Lasso Regularization
+```{r}
+# Find the best lasso lambda on the balanced data
+set.seed(80307)
+cv.lasso_reg <- cv.glmnet(train_x, train_y, nfolds = 10, alpha=1)
+plot(cv.lasso_reg)
+
+```
+```{r}
+# Print the best lasso lambda values
+cat("lambda.min_lasso:", cv.lasso_reg$lambda.min, "\n")
+cat("lambda.1se_lasso:", cv.lasso_reg$lambda.1se, "\n")
+```
+
+```{r}
+# Fit the lasso model with the best lambda
+model.min_lasso_reg <- glmnet(train_x, train_y, alpha= 1, lambda = cv.lasso_reg$lambda.min)
+model.min_lasso_reg
+# show the coefficients
+coef(model.min_lasso_reg)
+```
+
+```{r}
+# Predict on test data and build the confusion matrix
+pred_probs <- predict(model.min_lasso_reg, newx = test_x, s = "lambda.min", type = "response")
+pred_class <- ifelse(pred_probs > 0.5, 1, 0)
+
+conf_matrix_lasso_reg <- table(Actual = test_y, Predicted = pred_class)
+conf_matrix_lasso_reg
+```
+
+```{r}
+# Accuracy and recall for the balanced lasso model
+accuracy_lasso <- sum(diag(conf_matrix_lasso_reg)) / sum(conf_matrix_lasso_reg)
+cat("Accuracy:", accuracy_lasso, "\n")
+
+recall_lasso <- conf_matrix_lasso_reg[2, 2] / sum(conf_matrix_lasso_reg[2, ])
+cat("Recall:", recall_lasso, "\n")
+```
+
+### Support Vector Machine model
+```{r}
+# Train an SVM on the balanced data and check it on the training set
+svm_model <- svm(x = train_x, y = train_y, kernel = "radial", cost = 0.1)
+predictions_svm <- predict(svm_model, newdata = train_x)
+predicted.classes.svm <- ifelse(predictions_svm >=0.5,1,0)
+conf_matrix_svm <- table(Actual = train_y, Predicted = predicted.classes.svm)
+conf_matrix_svm
+```
+
+
+```{r}
+# Training accuracy and recall for the SVM
+accuracy_svm <- sum(diag(conf_matrix_svm)) / sum(conf_matrix_svm)
+cat("Accuracy:", accuracy_svm, "\n")
+
+recall_svm <- conf_matrix_svm[2, 2] / sum(conf_matrix_svm[2, ])
+cat("Recall:", recall_svm, "\n")
+```
+
+
+```{r}
+#### Now check the SVM on the unseen test data
+predictions_svm_test <- predict(svm_model, newdata = test_x)
+predicted.classes.svm_test <- ifelse(predictions_svm_test >=0.5,1,0)
+conf_matrix_svm_test <- table(Actual = test_y, Predicted = predicted.classes.svm_test)
+conf_matrix_svm_test
+```
+
+
+```{r}
+# Test accuracy and recall for the SVM
+accuracy_svm <- sum(diag(conf_matrix_svm_test)) / sum(conf_matrix_svm_test)
+cat("Accuracy:", accuracy_svm, "\n")
+
+recall_svm <- conf_matrix_svm_test[2, 2] / sum(conf_matrix_svm_test[2, ])
+cat("Recall:", recall_svm, "\n")
+```
+
+
+```{r}
+# ROC AUC Score: measures how well the model separates good from bad across all cutoffs
+probabilities <- predict(svm_model, test_x, probability = TRUE)
+
+roc_curve <- roc(test_y, probabilities)   # build the ROC curve
+svm_roc_auc <- auc(roc_curve)             # area under the curve (closer to 1 is better)
+print(svm_roc_auc)
+```
+
+
+```{r}
+# Draw the ROC curve
+plot(roc_curve, main = "ROC AUC Curve for SVM", col = "blue")
+# Add the AUC number to the plot as a legend
+legend("bottomright", legend = paste("AUC =", round(auc(roc_curve), 2)), col = "blue", lty = 1, cex = 0.8)
+
+```
+### Random Forest Classifier
+
+```{r}
+# Train a random forest with 100 trees on the balanced data
+rf_model <- randomForest(x = train_x, y = train_y, ntree = 100) #probabilities=TRUE)
+
+```
+
+
+```{r}
+# Predict on the training data and score it
+predictions_train <- predict(rf_model,train_x)
+predicted.classes.rf <- ifelse(predictions_train >=0.5,1,0)
+confusion_matrix_rf_tt <- table(Actual = train_y, Predicted = predicted.classes.rf)
+confusion_matrix_rf_tt
+```
+
+
+```{r}
+# Predict on the test data and score it
+predictions_test <- predict(rf_model, test_x)
+predicted.classes.rf_test <- ifelse(predictions_test >=0.5,1,0)
+confusion_matrix_rf_test <- table(Actual = test_y, Predicted = predicted.classes.rf_test)
+confusion_matrix_rf_test
+```
+
+```{r}
+# Recall on the test set: how many actual bad customers the forest caught
+recall_rf_test <- confusion_matrix_rf_test[2, 2] / sum(confusion_matrix_rf_test[2, ])
+cat("Recall:", recall_rf_test, "\n")
+```
+
+
+```{r}
+# ROC AUC Score for the random forest
+#probabilities_rf <- predict(rf_model, test_x, probability = TRUE)
+
+rf_roc_curve <- roc(test_y, predictions_test)
+rf_roc_auc <- auc(roc_curve)
+print(rf_roc_auc)
+
+```
+
+```{r}
+## Pull out how important each feature was in the random forest
+feat_imp_df <- importance(rf_model) %>% 
+  data.frame() %>% 
+  mutate(feature = row.names(.))   # turn the row names into a proper feature column
+```
+
+
+```{r}
+# Plot the feature importance as a horizontal bar chart (most important on top)
+ggplot(feat_imp_df, aes(x = reorder(feature, IncNodePurity), 
+                        y = IncNodePurity)) +
+  geom_bar(stat='identity') +
+  coord_flip() +                 # flip so labels are readable
+  theme_classic() +
+  labs(
+    x     = "Feature",
+    y     = "Importance",
+    title = "Feature Importance: <Model>"
+  )
+
+```
+
+### Decile mapping
+```{r}
+# Attach the predictions back to the test data so we can rank customers by risk
+mapped_test_x <- data.frame(test_x, 
+                            PredictedProb = 1- predictions_test,   # flip so higher = more likely good (or as intended)
+                            prediction = predicted.classes.rf_test,
+                            actual_target= test_y)
+dim(mapped_test_x)
+str(mapped_test_x)
+
+# Split customers into 10 equal groups (deciles) based on their predicted probability
+mapped_test_x$decile <- as.numeric(cut_number(mapped_test_x$PredictedProb,10))
+unique(mapped_test_x$decile)
+table(mapped_test_x$decile)
+```
+
+
+```{r}
+# Save the scored and decile-ranked test data to a CSV file
+write.csv(mapped_test_x, "decile_output2.csv", row.names=TRUE)
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
