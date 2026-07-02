@@ -104,6 +104,3 @@ Models are evaluated using **accuracy, recall, confusion matrices, and ROC/AUC**
 3. Run `Rscript.R` for the EDA and statistical analysis.
 4. Open and run `Credit_Card_Approval.Rmd` for preprocessing and modeling.
 
-## Notes
-
-This project is for educational and demonstration purposes, showing an end-to-end data management and modeling workflow in R on a public dataset.
